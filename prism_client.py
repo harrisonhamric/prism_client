@@ -22,6 +22,7 @@ import threading
 import os
 import sys
 import time
+import hashlib
 from datetime import datetime
 
 # AES encryption
@@ -29,6 +30,8 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
 # ─── Protocol Constants ──────────────────────────────────────────────────────
+
+DEBUG_MODE = False  # Set to False for release builds to disable logging
 
 PRISM_PORT = 14296
 CLIENT_VERSION = "1.0.0\x00\x00\x00"  # 8 bytes, padded
@@ -53,22 +56,52 @@ class PrismCrypto:
         if len(key) != 32:
             raise ValueError("Key must be exactly 32 bytes for AES-256")
         self.key = key
+        # Log key hash for debugging (not the actual key for security)
+        if DEBUG_MODE:
+            key_hash = hashlib.sha256(key).hexdigest()[:16]
+            print(f"[CRYPTO] Key initialized (hash: {key_hash}...)")
 
     def encrypt(self, plaintext: bytes) -> bytes:
-        """Encrypt with AES-256-CFB. Prepends random 16-byte IV to ciphertext."""
+        """Encrypt with AES-256-CFB8. Prepends random 16-byte IV to ciphertext."""
         iv = os.urandom(AES.block_size)
-        cipher = AES.new(self.key, AES.MODE_CFB, iv=iv, segment_size=128)
+        # Use CFB8 mode (segment_size=8) to match Go's cipher.NewCFBEncrypter
+        cipher = AES.new(self.key, AES.MODE_CFB, iv=iv, segment_size=8)
         ciphertext = cipher.encrypt(plaintext)
-        return iv + ciphertext
+        result = iv + ciphertext
+
+        if DEBUG_MODE:
+            print(f"[ENCRYPT] Plaintext: {plaintext[:50]!r} (len={len(plaintext)})")
+            print(f"[ENCRYPT] IV: {iv.hex()}")
+            print(f"[ENCRYPT] Ciphertext: {ciphertext.hex()[:32]}... (len={len(ciphertext)})")
+            print(f"[ENCRYPT] Total encrypted: {result.hex()[:32]}... (len={len(result)})")
+
+        return result
 
     def decrypt(self, data: bytes) -> bytes:
-        """Decrypt AES-256-CFB. Expects 16-byte IV prepended to ciphertext."""
+        """Decrypt AES-256-CFB8. Expects 16-byte IV prepended to ciphertext."""
+        if DEBUG_MODE:
+            print(f"[DECRYPT] Received data: {data.hex()[:32]}... (len={len(data)})")
+
         if len(data) < AES.block_size:
+            if DEBUG_MODE:
+                print(f"[DECRYPT] ERROR: Data too short ({len(data)} < {AES.block_size})")
             raise ValueError("Ciphertext too short")
+
         iv = data[:AES.block_size]
         ciphertext = data[AES.block_size:]
-        cipher = AES.new(self.key, AES.MODE_CFB, iv=iv, segment_size=128)
-        return cipher.decrypt(ciphertext)
+
+        if DEBUG_MODE:
+            print(f"[DECRYPT] IV: {iv.hex()}")
+            print(f"[DECRYPT] Ciphertext: {ciphertext.hex()[:32]}... (len={len(ciphertext)})")
+
+        # Use CFB8 mode (segment_size=8) to match Go's cipher.NewCFBDecrypter
+        cipher = AES.new(self.key, AES.MODE_CFB, iv=iv, segment_size=8)
+        plaintext = cipher.decrypt(ciphertext)
+
+        if DEBUG_MODE:
+            print(f"[DECRYPT] Plaintext: {plaintext[:50]!r} (len={len(plaintext)})")
+
+        return plaintext
 
 
 # ─── Protocol Implementation ─────────────────────────────────────────────────
@@ -105,18 +138,23 @@ class PrismProtocol:
         Byte 0:     packet type (0x14)
         Byte 1:     username length
         Byte 2-21:  username (UTF-8, padded to 20 bytes)
-        Byte 22:    encrypted boolean
-        Byte 23:    message length
-        Byte 24+:   message data
+        Byte 22:    reserved/padding (0x00)
+        Byte 23:    encrypted boolean
+        Byte 24:    message length (1 byte, 0-255)
+        Byte 25+:   message data
         """
         uname_bytes = username.encode("utf-8")[:MAX_USERNAME_LEN]
         uname_padded = uname_bytes.ljust(MAX_USERNAME_LEN, b'\x00')
 
+        if len(message) > 255:
+            raise ValueError("Message too long (max 255 bytes)")
+
         packet = (
             bytes([PKT_GENERAL_MESSAGE, len(uname_bytes)])
             + uname_padded
-            + bytes([0x01 if encrypted else 0x00])
-            + bytes([len(message)])
+            + bytes([0x00])  # Reserved/padding byte
+            + bytes([0x01 if encrypted else 0x00])  # Encrypted flag
+            + bytes([len(message)])  # Message length (1 byte)
             + message
         )
         return PrismProtocol.encode_size_prefix(packet)
@@ -206,16 +244,31 @@ class PrismProtocol:
             "encrypted": False,
             "message": b"",
         }
-        if len(data) < 24:
+        if len(data) < 25:  # Need at least 25 bytes minimum
+            if DEBUG_MODE:
+                print(f"[PARSE] Packet too short: {len(data)} bytes")
             return result
 
         uname_len = data[1]
         result["username"] = data[2:2 + uname_len].decode("utf-8", errors="replace")
-        result["encrypted"] = data[22] == 0x01
 
-        if len(data) >= 24:
-            msg_len = data[23]
-            result["message"] = data[24:24 + msg_len]
+        # Byte 22 is reserved/padding (ignore)
+        # Encrypted flag is at byte 23
+        result["encrypted"] = data[23] == 0x01
+
+        # Message length is at byte 24 (1 byte, 0-255)
+        msg_len = data[24]
+
+        if DEBUG_MODE:
+            print(f"[PARSE] Username: {result['username']}, encrypted: {result['encrypted']}, msg_len: {msg_len}")
+            print(f"[PARSE] Raw bytes [22-25]: {data[22:26].hex()}")
+
+        # Message data starts at byte 25
+        if len(data) >= 25 + msg_len:
+            result["message"] = data[25:25 + msg_len]
+        else:
+            if DEBUG_MODE:
+                print(f"[PARSE] WARNING: Expected {25 + msg_len} bytes, got {len(data)}")
 
         return result
 
@@ -276,10 +329,16 @@ class PrismClient:
         if not self.connected or not self.sock:
             return
 
+        if DEBUG_MODE:
+            print(f"\n[SEND] Original message: {text!r}")
         plaintext = text.encode("utf-8")
         ciphertext = self.crypto.encrypt(plaintext)
 
         pkt = PrismProtocol.build_message_packet(self.username, ciphertext, encrypted=True)
+        if DEBUG_MODE:
+            print(f"[SEND] Packet size: {len(pkt)} bytes")
+            print(f"[SEND] Sending packet...\n")
+
         try:
             self.sock.sendall(pkt)
         except Exception as e:
@@ -362,13 +421,25 @@ class PrismClient:
 
         elif pkt_type == PKT_GENERAL_MESSAGE:
             username = pkt["username"]
+            if DEBUG_MODE:
+                print(f"\n[RECEIVE] Message from: {username}")
+                print(f"[RECEIVE] Encrypted flag: {pkt['encrypted']}")
+                print(f"[RECEIVE] Message data: {pkt['message'].hex()[:32]}... (len={len(pkt['message'])})")
+
             if pkt["encrypted"] and self.crypto:
                 try:
-                    plaintext = self.crypto.decrypt(pkt["message"]).decode("utf-8", errors="replace")
-                except Exception:
+                    decrypted = self.crypto.decrypt(pkt["message"])
+                    plaintext = decrypted.decode("utf-8", errors="replace")
+                    if DEBUG_MODE:
+                        print(f"[RECEIVE] Successfully decrypted: {plaintext!r}\n")
+                except Exception as e:
+                    if DEBUG_MODE:
+                        print(f"[RECEIVE] Decryption FAILED: {e}\n")
                     plaintext = "[Could not decrypt message — wrong key?]"
             else:
                 plaintext = pkt["message"].decode("utf-8", errors="replace")
+                if DEBUG_MODE:
+                    print(f"[RECEIVE] Unencrypted message: {plaintext!r}\n")
 
             self.on_message(username, plaintext)
 
@@ -563,7 +634,7 @@ class PrismGUI:
         self.entry_user.grid(row=3, column=0, columnspan=2, pady=(0, 16))
 
         # Encryption key
-        ttk.Label(fields_frame, text="32-BYTE ENCRYPTION KEY",
+        ttk.Label(fields_frame, text="ENCRYPTION KEY / PASSWORD",
                   style="Field.TLabel").grid(row=4, column=0, columnspan=2,
                                              sticky="w", pady=(0, 4))
         self.entry_key = tk.Entry(fields_frame, width=48,
@@ -577,22 +648,35 @@ class PrismGUI:
                                   highlightbackground=Theme.BORDER)
         self.entry_key.grid(row=5, column=0, columnspan=2, pady=(0, 8))
 
+        # Password mode toggle
+        self.use_password_var = tk.BooleanVar(value=True)
+        self.password_mode_btn = tk.Checkbutton(
+            fields_frame, text="Use password (SHA-256 hash)", variable=self.use_password_var,
+            command=self._update_key_info,
+            bg=Theme.BG_DARK, fg=Theme.TEXT_DIM,
+            selectcolor=Theme.BG_LIGHT,
+            activebackground=Theme.BG_DARK,
+            activeforeground=Theme.TEXT_DIM,
+            font=(self.font_ui, 9))
+        self.password_mode_btn.grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 4))
+
         # Show/hide key toggle
         self.show_key_var = tk.BooleanVar(value=False)
         self.show_key_btn = tk.Checkbutton(
-            fields_frame, text="Show key", variable=self.show_key_var,
+            fields_frame, text="Show key/password", variable=self.show_key_var,
             command=self._toggle_key_visibility,
             bg=Theme.BG_DARK, fg=Theme.TEXT_DIM,
             selectcolor=Theme.BG_LIGHT,
             activebackground=Theme.BG_DARK,
             activeforeground=Theme.TEXT_DIM,
             font=(self.font_ui, 9))
-        self.show_key_btn.grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self.show_key_btn.grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 4))
 
         # Key info
-        ttk.Label(fields_frame,
-                  text="Enter exactly 32 ASCII characters, or 64 hex characters (0-9, a-f)",
-                  style="Subtitle.TLabel").grid(row=7, column=0, columnspan=2,
+        self.key_info_label = ttk.Label(fields_frame,
+                  text="Enter any password - will be hashed with SHA-256 to create 32-byte key",
+                  style="Subtitle.TLabel")
+        self.key_info_label.grid(row=8, column=0, columnspan=2,
                                                 sticky="w", pady=(0, 20))
 
         # Connect button
@@ -618,6 +702,16 @@ class PrismGUI:
         else:
             self.entry_key.configure(show="•")
 
+    def _update_key_info(self):
+        if self.use_password_var.get():
+            self.key_info_label.configure(
+                text="Enter any password - will be hashed with SHA-256 to create 32-byte key"
+            )
+        else:
+            self.key_info_label.configure(
+                text="Enter exactly 32 ASCII characters, or 64 hex characters (0-9, a-f)"
+            )
+
     def _do_connect(self):
         """Validate inputs and attempt connection."""
         host = self.entry_host.get().strip()
@@ -641,7 +735,11 @@ class PrismGUI:
             self._show_connect_error(f"Username must be {MAX_USERNAME_LEN} characters or fewer")
             return
 
-        # Parse key: accept 32 ASCII chars or 64 hex chars
+        # Parse key
+        if not key_input:
+            self._show_connect_error("Password/key is required")
+            return
+
         key = self._parse_key(key_input)
         if key is None:
             self._show_connect_error("Key must be 32 ASCII characters or 64 hex characters")
@@ -670,14 +768,19 @@ class PrismGUI:
 
     def _parse_key(self, key_input: str) -> bytes:
         """Parse encryption key from user input."""
-        if len(key_input) == 32:
-            return key_input.encode("utf-8")
-        elif len(key_input) == 64:
-            try:
-                return bytes.fromhex(key_input)
-            except ValueError:
-                return None
-        return None
+        if self.use_password_var.get():
+            # Password mode - hash any input with SHA-256 to get 32 bytes
+            return hashlib.sha256(key_input.encode("utf-8")).digest()
+        else:
+            # Raw key mode - require exactly 32 bytes
+            if len(key_input) == 32:
+                return key_input.encode("utf-8")
+            elif len(key_input) == 64:
+                try:
+                    return bytes.fromhex(key_input)
+                except ValueError:
+                    return None
+            return None
 
     def _show_connect_error(self, msg: str):
         self.lbl_connect_error.configure(text=msg, fg=Theme.ERROR)
