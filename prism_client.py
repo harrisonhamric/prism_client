@@ -331,16 +331,26 @@ class PrismClient:
 
         if DEBUG_MODE:
             print(f"\n[SEND] Original message: {text!r}")
+
         plaintext = text.encode("utf-8")
+
+        # Check message length (encrypted message = plaintext + 16-byte IV, max 255 bytes)
+        # So max plaintext is 255 - 16 = 239 bytes
+        if len(plaintext) > 239:
+            self.on_error(f"Message too long ({len(plaintext)} bytes). Maximum is 239 bytes.")
+            return
+
         ciphertext = self.crypto.encrypt(plaintext)
 
-        pkt = PrismProtocol.build_message_packet(self.username, ciphertext, encrypted=True)
-        if DEBUG_MODE:
-            print(f"[SEND] Packet size: {len(pkt)} bytes")
-            print(f"[SEND] Sending packet...\n")
-
         try:
+            pkt = PrismProtocol.build_message_packet(self.username, ciphertext, encrypted=True)
+            if DEBUG_MODE:
+                print(f"[SEND] Packet size: {len(pkt)} bytes")
+                print(f"[SEND] Sending packet...\n")
+
             self.sock.sendall(pkt)
+        except ValueError as e:
+            self.on_error(str(e))
         except Exception as e:
             self.on_error(f"Send failed: {e}")
             self.disconnect()
@@ -561,10 +571,12 @@ class PrismGUI:
                              background=Theme.ACCENT,
                              foreground="#ffffff",
                              font=(self.font_ui, 11, "bold"),
-                             padding=(20, 10),
-                             borderwidth=0)
+                             padding=(20, 12),  # Increased vertical padding
+                             borderwidth=0,
+                             relief="flat")
         self.style.map("Accent.TButton",
-                       background=[("active", Theme.ACCENT_HOVER)])
+                       background=[("active", Theme.ACCENT_HOVER)],
+                       relief=[("pressed", "flat")])
 
         self.style.configure("Flat.TButton",
                              background=Theme.BG_LIGHT,
@@ -862,46 +874,59 @@ class PrismGUI:
             bg=Theme.BG_DARK,
             fg=Theme.TEXT,
             font=(self.font_mono, 11),
-            wrap="word",
+            wrap="word",  # Wrap at word boundaries
             relief="flat",
-            padx=16,
+            padx=20,  # Increased padding to prevent edge overflow
             pady=12,
             cursor="arrow",
             state="disabled",
-            spacing1=2,
-            spacing3=2,
+            spacing1=3,  # Spacing before paragraph
+            spacing2=1,  # Spacing between lines in paragraph
+            spacing3=3,  # Spacing after paragraph
             selectbackground=Theme.ACCENT,
             selectforeground="#ffffff",
             highlightthickness=0,
             borderwidth=0,
         )
-        self.chat_display.pack(fill="both", expand=True)
+        self.chat_display.pack(fill="both", expand=True, padx=0, pady=0)
 
-        # Configure text tags for styling
+        # Configure text tags for styling with proper margins
         self.chat_display.tag_configure("system",
                                         foreground=Theme.TEXT_MUTED,
-                                        font=(self.font_ui, 10, "italic"))
+                                        font=(self.font_ui, 10, "italic"),
+                                        rmargin=20,
+                                        lmargin2=10)  # Hanging indent for wrapped lines
         self.chat_display.tag_configure("timestamp",
                                         foreground=Theme.TEXT_MUTED,
                                         font=(self.font_mono, 9))
         self.chat_display.tag_configure("error",
                                         foreground=Theme.ERROR,
-                                        font=(self.font_ui, 10))
+                                        font=(self.font_ui, 10),
+                                        rmargin=20,
+                                        lmargin2=10)
         self.chat_display.tag_configure("join",
                                         foreground=Theme.SUCCESS,
-                                        font=(self.font_ui, 10))
+                                        font=(self.font_ui, 10),
+                                        rmargin=20,
+                                        lmargin2=10)
         self.chat_display.tag_configure("leave",
                                         foreground=Theme.WARNING,
-                                        font=(self.font_ui, 10))
+                                        font=(self.font_ui, 10),
+                                        rmargin=20,
+                                        lmargin2=10)
         self.chat_display.tag_configure("message_body",
                                         foreground=Theme.TEXT,
-                                        font=(self.font_mono, 11))
+                                        font=(self.font_mono, 11),
+                                        rmargin=20,  # Right margin
+                                        lmargin2=40,  # Indent wrapped lines
+                                        wrap="word")
 
-        # Create user-color tags
+        # Create user-color tags with proper wrapping
         for i, color in enumerate(Theme.USER_COLORS):
             self.chat_display.tag_configure(f"user_color_{i}",
                                             foreground=color,
-                                            font=(self.font_ui, 11, "bold"))
+                                            font=(self.font_ui, 11, "bold"),
+                                            rmargin=20)
 
         # Scrollbar
         scrollbar = tk.Scrollbar(self.chat_display, command=self.chat_display.yview,
@@ -912,19 +937,23 @@ class PrismGUI:
         self.chat_display.configure(yscrollcommand=scrollbar.set)
 
         # ── Input bar ──
-        input_bar = tk.Frame(chat_area, bg=Theme.BG_MEDIUM, height=56)
+        input_bar = tk.Frame(chat_area, bg=Theme.BG_MEDIUM, height=76)
         input_bar.pack(fill="x", side="bottom")
         input_bar.pack_propagate(False)
 
+        # Top row: encryption indicator + text entry + send button
+        input_row = tk.Frame(input_bar, bg=Theme.BG_MEDIUM)
+        input_row.pack(fill="x", padx=0, pady=(10, 2))
+
         # Encryption indicator
-        lock_lbl = tk.Label(input_bar, text="🔒",
+        lock_lbl = tk.Label(input_row, text="🔒",
                             bg=Theme.BG_MEDIUM, fg=Theme.SUCCESS,
                             font=(self.font_ui, 14))
         lock_lbl.pack(side="left", padx=(12, 4))
 
         # Text entry
         self.msg_entry = tk.Entry(
-            input_bar,
+            input_row,
             bg=Theme.BG_INPUT,
             fg=Theme.TEXT,
             insertbackground=Theme.TEXT,
@@ -935,15 +964,25 @@ class PrismGUI:
             highlightcolor=Theme.ACCENT,
             highlightbackground=Theme.BORDER,
         )
-        self.msg_entry.pack(side="left", fill="both", expand=True, padx=(4, 8), pady=10)
+        self.msg_entry.pack(side="left", fill="both", expand=True, padx=(4, 8))
         self.msg_entry.bind("<Return>", self._on_send)
+        self.msg_entry.bind("<KeyRelease>", self._update_char_count)
         self.msg_entry.focus_set()
 
         # Send button
-        self.btn_send = ttk.Button(input_bar, text="Send",
+        self.btn_send = ttk.Button(input_row, text="Send",
                                    style="Accent.TButton",
                                    command=lambda: self._on_send(None))
-        self.btn_send.pack(side="right", padx=(0, 12), pady=10)
+        self.btn_send.pack(side="right", padx=(0, 12))
+
+        # Bottom row: character counter
+        counter_row = tk.Frame(input_bar, bg=Theme.BG_MEDIUM)
+        counter_row.pack(fill="x", padx=12, pady=(0, 8))
+
+        self.char_counter = tk.Label(counter_row, text="0 / 239 bytes",
+                                     bg=Theme.BG_MEDIUM, fg=Theme.TEXT_MUTED,
+                                     font=(self.font_ui, 9))
+        self.char_counter.pack(side="right")
 
         # Initial system message
         self._append_system("Connected to server. Messages are end-to-end encrypted with AES-256.")
@@ -971,7 +1010,13 @@ class PrismGUI:
                 self.chat_display.insert("end", text)
         self.chat_display.insert("end", "\n")
         self.chat_display.configure(state="disabled")
-        self.chat_display.see("end")
+
+        # Auto-scroll to bottom - schedule after UI updates
+        def scroll_to_bottom():
+            self.chat_display.see("end")
+            self.chat_display.yview("end")
+
+        self.root.after(10, scroll_to_bottom)  # Small delay ensures text is rendered first
 
     def _timestamp(self) -> str:
         return datetime.now().strftime("%H:%M")
@@ -1023,13 +1068,39 @@ class PrismGUI:
 
     # ── Event Handlers ────────────────────────────────────────────────────
 
+    def _update_char_count(self, event=None):
+        """Update the character counter."""
+        msg = self.msg_entry.get()
+        byte_count = len(msg.encode("utf-8"))
+        max_bytes = 239
+
+        if byte_count > max_bytes:
+            self.char_counter.configure(text=f"{byte_count} / {max_bytes} bytes",
+                                       fg=Theme.ERROR)
+        elif byte_count > max_bytes * 0.9:  # Warning at 90%
+            self.char_counter.configure(text=f"{byte_count} / {max_bytes} bytes",
+                                       fg=Theme.WARNING)
+        else:
+            self.char_counter.configure(text=f"{byte_count} / {max_bytes} bytes",
+                                       fg=Theme.TEXT_MUTED)
+
     def _on_send(self, event):
         """Handle sending a message."""
         msg = self.msg_entry.get().strip()
         if not msg or not self.client or not self.client.connected:
             return
 
+        # Check message length before sending
+        byte_count = len(msg.encode("utf-8"))
+        if byte_count > 239:
+            self._append_text([
+                (f"  {self._timestamp()}  ", "timestamp"),
+                (f"Message too long ({byte_count} bytes). Maximum is 239 bytes.", "error"),
+            ])
+            return
+
         self.msg_entry.delete(0, "end")
+        self._update_char_count()  # Reset counter
         self.client.send_message(msg)
 
     def _do_disconnect(self):
